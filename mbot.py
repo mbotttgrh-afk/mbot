@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TwoOrders Binance Futures v7.20 (Hedge Mode + 75x Leverage)
-Requires: pip install python-binance
+Corrected: rate-limit guard, ban wait, notional safety, stable client IDs
 """
 
 import time
@@ -44,7 +44,7 @@ MAX_LOT = 500
 RESET_MARTINGALE = False
 
 MAGIC = 123456789
-POLL_INTERVAL = 2
+POLL_INTERVAL = 5  # Increased from 2s to 5s to reduce request rate
 
 # ================== GLOBALS ==================
 client = None
@@ -57,6 +57,32 @@ g_tick_size = None
 g_digits = 8
 g_last_trade_id = 0
 g_hedge_mode = False
+g_last_request_time = 0
+g_min_request_interval = 0.6  # Minimum interval between two REST requests (seconds)
+
+# ================== RATE LIMIT GUARD ==================
+def safe_call(func, *args, **kwargs):
+    """Wrap any Binance REST call with rate-limit guard and ban wait."""
+    global g_last_request_time
+    elapsed = time.time() - g_last_request_time
+    if elapsed < g_min_request_interval:
+        time.sleep(g_min_request_interval - elapsed)
+
+    try:
+        result = func(*args, **kwargs)
+        g_last_request_time = time.time()
+        return result
+    except BinanceAPIException as e:
+        if e.code == -1003 or getattr(e, "status_code", None) == 418:
+            # IP banned — wait long enough for ban to lift
+            print(f"[RATE LIMIT] IP banned. Waiting 180s before retry...")
+            time.sleep(180)
+            return None
+        if getattr(e, "status_code", None) == 429:
+            print("[RATE LIMIT] 429 received. Waiting 60s...")
+            time.sleep(60)
+            return None
+        raise
 
 # ================== HELPERS ==================
 def init_client():
@@ -68,35 +94,33 @@ def init_client():
     )
     client.futures_ping()
 
-    # ---- Step 1: Cancel ALL existing orders on this symbol ----
-    # This is REQUIRED before Hedge Mode can be enabled.
+    # Cancel all normal orders
     print("[INIT] Cleaning existing orders on", SYMBOL, "...")
     try:
-        client.futures_cancel_all_open_orders(symbol=SYMBOL)
+        safe_call(client.futures_cancel_all_open_orders, symbol=SYMBOL)
         print("[INIT] All open orders cancelled.")
     except BinanceAPIException as e:
-        # -2011 = "Unknown order sent" (no orders to cancel) — safe to ignore
         if e.code == -2011 or "Unknown order" in e.message:
             print("[INIT] No open orders to cancel.")
         else:
             print(f"[INIT] Cancel-all warning: {e.message}")
 
-    # Also cancel algo/conditional orders
+    # Cancel algo orders
     try:
-        algo_orders = client.futures_get_open_algo_orders(symbol=SYMBOL)
-        for o in algo_orders:
-            try:
-                client.futures_cancel_algo_order(symbol=SYMBOL, algoId=o["algoId"])
-            except Exception:
-                pass
+        algo_orders = safe_call(client.futures_get_open_algo_orders, symbol=SYMBOL)
         if algo_orders:
+            for o in algo_orders:
+                try:
+                    safe_call(client.futures_cancel_algo_order, symbol=SYMBOL, algoId=o["algoId"])
+                except Exception:
+                    pass
             print(f"[INIT] Cancelled {len(algo_orders)} algo order(s).")
     except Exception as e:
         print(f"[INIT] Algo cancel warning: {e}")
 
-    # ---- Step 2: Enable Hedge Mode ----
+    # Enable Hedge Mode
     try:
-        client.futures_change_position_mode(dualSidePosition=True)
+        safe_call(client.futures_change_position_mode, dualSidePosition=True)
         print("[INIT] Hedge Mode ENABLED")
         g_hedge_mode = True
     except BinanceAPIException as e:
@@ -105,18 +129,17 @@ def init_client():
             g_hedge_mode = True
         else:
             print(f"[INIT] FATAL: Cannot enable Hedge Mode: {e.message}")
-            print("[INIT] Cancel all DOGE orders/positions manually and restart.")
             raise SystemExit(1)
 
-    # ---- Step 3: Set 75x leverage ----
+    # Set leverage
     try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        safe_call(client.futures_change_leverage, symbol=SYMBOL, leverage=LEVERAGE)
         print(f"[INIT] Leverage set to {LEVERAGE}x")
     except BinanceAPIException as e:
         print(f"[INIT] Leverage error: {e.message}")
 
-    # ---- Step 4: Symbol filters ----
-    info = client.futures_exchange_info()
+    # Symbol filters
+    info = safe_call(client.futures_exchange_info)
     for s in info["symbols"]:
         if s["symbol"] == SYMBOL:
             g_symbol_info = s
@@ -150,19 +173,21 @@ def normalize_price(price):
     return round(p, g_digits)
 
 def fetch_price():
-    t = client.futures_symbol_ticker(symbol=SYMBOL)
-    return float(t["price"])
+    t = safe_call(client.futures_symbol_ticker, symbol=SYMBOL)
+    return float(t["price"]) if t else None
 
 def fetch_positions():
-    poss = client.futures_position_information(symbol=SYMBOL)
+    poss = safe_call(client.futures_position_information, symbol=SYMBOL)
+    if not poss:
+        return []
     return [p for p in poss if abs(float(p["positionAmt"])) > 0]
 
 def fetch_open_orders():
-    return client.futures_get_open_orders(symbol=SYMBOL)
+    return safe_call(client.futures_get_open_orders, symbol=SYMBOL) or []
 
 def fetch_open_algo_orders():
     try:
-        return client.futures_get_open_algo_orders(symbol=SYMBOL)
+        return safe_call(client.futures_get_open_algo_orders, symbol=SYMBOL) or []
     except Exception:
         return []
 
@@ -204,16 +229,16 @@ def cancel_all_my_orders():
     n = 0
     for o in fetch_open_orders():
         try:
-            client.futures_cancel_order(symbol=SYMBOL, orderId=o["orderId"])
+            safe_call(client.futures_cancel_order, symbol=SYMBOL, orderId=o["orderId"])
             n += 1
-        except Exception as e:
-            print(f"  cancel normal failed: {e}")
+        except Exception:
+            pass
     for o in fetch_open_algo_orders():
         try:
-            client.futures_cancel_algo_order(symbol=SYMBOL, algoId=o["algoId"])
+            safe_call(client.futures_cancel_algo_order, symbol=SYMBOL, algoId=o["algoId"])
             n += 1
-        except Exception as e:
-            print(f"  cancel algo failed: {e}")
+        except Exception:
+            pass
     if n:
         print(f"  Cancelled {n} order(s)")
     return n
@@ -224,14 +249,14 @@ def cancel_side_orders(cancel_long: bool):
     for o in fetch_open_orders():
         if o.get("positionSide") == target_side:
             try:
-                client.futures_cancel_order(symbol=SYMBOL, orderId=o["orderId"])
+                safe_call(client.futures_cancel_order, symbol=SYMBOL, orderId=o["orderId"])
                 n += 1
             except Exception:
                 pass
     for o in fetch_open_algo_orders():
         if o.get("positionSide") == target_side:
             try:
-                client.futures_cancel_algo_order(symbol=SYMBOL, algoId=o["algoId"])
+                safe_call(client.futures_cancel_algo_order, symbol=SYMBOL, algoId=o["algoId"])
                 n += 1
             except Exception:
                 pass
@@ -253,7 +278,7 @@ def orders_per_side():
             return MAX_ORDERS_PER_SIDE
     return max(1, min(n, MAX_ORDERS_PER_SIDE))
 
-# ================== TRADING (Hedge Mode) ==================
+# ================== TRADING ==================
 def place_entry_orders(anchor, lot, n_per_side):
     placed = 0
     for level in range(1, n_per_side + 1):
@@ -262,7 +287,7 @@ def place_entry_orders(anchor, lot, n_per_side):
 
         buy_cid = f"ENT_L_{MAGIC}_{level}_{int(anchor * 1e8)}"
         try:
-            client.futures_create_algo_order(
+            safe_call(client.futures_create_algo_order,
                 algoType="CONDITIONAL",
                 symbol=SYMBOL,
                 side=SIDE_BUY,
@@ -276,15 +301,15 @@ def place_entry_orders(anchor, lot, n_per_side):
             placed += 1
             print(f"  BuyStop L{level} (LONG) @ {buy_price} ok")
         except BinanceAPIException as e:
-            if "Duplicate" in str(e.message) or "duplicate" in str(e.message).lower():
+            if "Duplicate" in str(e.message):
                 placed += 1
-                print(f"  BuyStop L{level} already exists (retry detected)")
+                print(f"  BuyStop L{level} already exists")
             else:
                 print(f"  BuyStop L{level} failed: {e.message}")
 
         sell_cid = f"ENT_S_{MAGIC}_{level}_{int(anchor * 1e8)}"
         try:
-            client.futures_create_algo_order(
+            safe_call(client.futures_create_algo_order,
                 algoType="CONDITIONAL",
                 symbol=SYMBOL,
                 side=SIDE_SELL,
@@ -298,9 +323,9 @@ def place_entry_orders(anchor, lot, n_per_side):
             placed += 1
             print(f"  SellStop L{level} (SHORT) @ {sell_price} ok")
         except BinanceAPIException as e:
-            if "Duplicate" in str(e.message) or "duplicate" in str(e.message).lower():
+            if "Duplicate" in str(e.message):
                 placed += 1
-                print(f"  SellStop L{level} already exists (retry detected)")
+                print(f"  SellStop L{level} already exists")
             else:
                 print(f"  SellStop L{level} failed: {e.message}")
 
@@ -320,7 +345,7 @@ def place_sl_for_position(pos):
 
     cid = f"SL_{MAGIC}_{int(entry * 1e8)}"
     try:
-        resp = client.futures_create_algo_order(
+        safe_call(client.futures_create_algo_order,
             algoType="CONDITIONAL",
             symbol=SYMBOL,
             side=side,
@@ -332,13 +357,13 @@ def place_sl_for_position(pos):
             clientAlgoId=cid,
         )
         print(f"  SL placed: {pos_side} {side} trigger={sl_price} ok")
-        return resp
+        return True
     except BinanceAPIException as e:
-        if "Duplicate" in str(e.message) or "duplicate" in str(e.message).lower():
-            print(f"  SL already exists for {pos_side} (retry detected)")
-            return None
+        if "Duplicate" in str(e.message):
+            print(f"  SL already exists for {pos_side}")
+            return True
         print(f"  SL placement failed: {e.message}")
-        return None
+        return False
 
 def update_trailing_sl():
     positions = fetch_positions()
@@ -346,6 +371,8 @@ def update_trailing_sl():
         return
 
     price = fetch_price()
+    if price is None:
+        return
     sl_orders = fetch_open_algo_orders()
 
     for pos in positions:
@@ -368,7 +395,7 @@ def update_trailing_sl():
             for o in sl_orders:
                 if o.get("positionSide") == "LONG" and o.get("side") == SIDE_SELL:
                     try:
-                        client.futures_cancel_algo_order(symbol=SYMBOL, algoId=o["algoId"])
+                        safe_call(client.futures_cancel_algo_order, symbol=SYMBOL, algoId=o["algoId"])
                     except Exception:
                         pass
             place_sl_for_position(pos)
@@ -388,7 +415,7 @@ def update_trailing_sl():
             for o in sl_orders:
                 if o.get("positionSide") == "SHORT" and o.get("side") == SIDE_BUY:
                     try:
-                        client.futures_cancel_algo_order(symbol=SYMBOL, algoId=o["algoId"])
+                        safe_call(client.futures_cancel_algo_order, symbol=SYMBOL, algoId=o["algoId"])
                     except Exception:
                         pass
             place_sl_for_position(pos)
@@ -396,7 +423,9 @@ def update_trailing_sl():
 def check_fills_and_update_martingale():
     global g_mult, g_last_trade_id
     try:
-        trades = client.futures_account_trades(symbol=SYMBOL, limit=50)
+        trades = safe_call(client.futures_account_trades, symbol=SYMBOL, limit=50)
+        if not trades:
+            return
     except Exception:
         return
     trades.sort(key=lambda t: int(t["id"]))
@@ -424,11 +453,11 @@ def display_dashboard():
 
     print("\n" + "=" * 55)
     print(f"  TwoOrders Hedge | {SYMBOL} | {LEVERAGE}x")
-    print(f"  Price: {price}")
+    print(f"  Price: {price if price else 'N/A'}")
     print(f"  Positions: {len(positions)}")
     print(f"  Orders: {len(orders)}")
     print(f"  Anchor: {g_anchor if g_anchor > 0 else 'None'}")
-    if g_anchor > 0:
+    if g_anchor > 0 and price:
         print(f"  Drift: {abs(price - g_anchor):.6f} / {RECENTER_DISTANCE}")
     print(f"  Multiplier: x{g_mult:.2f}  |  Streak: {loss_streak()}")
     print(f"  Next lot: {normalize_qty(min(BASE_LOT * g_mult, MAX_LOT))}")
@@ -465,6 +494,10 @@ def main():
     while True:
         try:
             price = fetch_price()
+            if price is None:
+                time.sleep(30)
+                continue
+
             pos_count = count_my_positions()
             ord_count = count_my_orders()
 
@@ -508,10 +541,19 @@ def main():
                 n = orders_per_side()
                 anchor = price
 
-                acct = client.futures_account()
+                acct = safe_call(client.futures_account)
+                if acct is None:
+                    time.sleep(30)
+                    continue
                 free_margin = float(acct["availableBalance"])
                 total_notional = lot * price * n * 2
                 required_margin = total_notional / LEVERAGE
+
+                # Notional safety: each order must be >= 5 USDT
+                if total_notional < 5:
+                    print(f"  SKIP: notional {total_notional:.2f} < 5 USDT minimum")
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
                 if required_margin > free_margin * 0.8:
                     print(f"  SKIP: margin tight (need={required_margin:.4f} "
@@ -533,7 +575,7 @@ def main():
 
         except Exception as e:
             print(f"\n[ERROR] {e}")
-            time.sleep(10)
+            time.sleep(15)
 
         time.sleep(POLL_INTERVAL)
 
